@@ -1,0 +1,1238 @@
+
+===== src/notification_service/domain/entities/__init__.py =====
+
+from .notification import Notification
+
+__all__ = [
+    "Notification",
+]
+===== src/notification_service/domain/entities/notification.py =====
+
+# src/notification_service/domain/entities/notification.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from ..events.notification_delivery_failed import NotificationDeliveryFailed
+from ..events.notification_sent import NotificationSent
+from ..exceptions.domain_exceptions import (
+    InvalidNotificationStateTransition,
+)
+from ..value_objects.delivery_log import DeliveryLog
+from ..value_objects.notification_channel import NotificationChannel
+from ..value_objects.notification_id import NotificationId
+from ..value_objects.notification_status import NotificationStatus
+from ..value_objects.recipient import Recipient
+
+
+@dataclass
+class Notification:
+    """
+    Aggregate Root representing a notification delivery intention.
+
+    The aggregate owns its lifecycle, audit log and domain events.
+    """
+
+    id: NotificationId
+    recipient: Recipient
+    channel: NotificationChannel
+    content: str
+
+    status: NotificationStatus = field(
+        default=NotificationStatus.PENDING,
+        init=False,
+    )
+
+    delivery_logs: list[DeliveryLog] = field(
+        default_factory=list,
+        init=False,
+    )
+
+    _domain_events: list[object] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not self.content.strip():
+            raise ValueError("Notification content cannot be empty.")
+
+        self._append_delivery_log(
+            status=NotificationStatus.PENDING,
+            message="Notification created.",
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        recipient: Recipient,
+        channel: NotificationChannel,
+        content: str,
+    ) -> Notification:
+        """
+        Create a new Notification aggregate.
+
+        The domain owns the generation of the NotificationId so that
+        application services do not need to know how aggregate identity
+        is created.
+        """
+        return cls(
+            id=NotificationId.generate(),
+            recipient=recipient,
+            channel=channel,
+            content=content,
+        )
+
+    def mark_as_sent(self) -> None:
+        """
+        Transition the notification from PENDING to SENT.
+
+        Raises:
+            InvalidNotificationStateTransition:
+                if the notification is not currently PENDING.
+        """
+        self._transition_to(
+            new_status=NotificationStatus.SENT,
+            message="Notification delivered successfully.",
+        )
+
+        self._record_event(
+            NotificationSent(
+                notification_id=self.id,
+                occurred_at=datetime.now(timezone.utc),
+            )
+        )
+
+    def mark_as_failed(self, reason: str) -> None:
+        """
+        Transition the notification from PENDING to FAILED.
+
+        Raises:
+            InvalidNotificationStateTransition:
+                if the notification is not currently PENDING.
+
+            ValueError:
+                if the failure reason is empty.
+        """
+        if not reason.strip():
+            raise ValueError("Failure reason cannot be empty.")
+
+        self._transition_to(
+            new_status=NotificationStatus.FAILED,
+            message=reason,
+        )
+
+        self._record_event(
+            NotificationDeliveryFailed(
+                notification_id=self.id,
+                reason=reason,
+                occurred_at=datetime.now(timezone.utc),
+            )
+        )
+
+    def pull_domain_events(self) -> list[object]:
+        """
+        Return and clear the currently pending domain events.
+
+        Events are intentionally kept inside the aggregate until explicitly
+        pulled by the application layer.
+        """
+        events = list(self._domain_events)
+        self._domain_events.clear()
+
+        return events
+
+    def _transition_to(
+        self,
+        *,
+        new_status: NotificationStatus,
+        message: str,
+    ) -> None:
+        if not self._is_valid_transition(new_status):
+            raise InvalidNotificationStateTransition(
+                current_status=self.status.value,
+                requested_status=new_status.value,
+            )
+
+        self.status = new_status
+
+        self._append_delivery_log(
+            status=new_status,
+            message=message,
+        )
+
+    def _is_valid_transition(
+        self,
+        new_status: NotificationStatus,
+    ) -> bool:
+        return (
+            self.status == NotificationStatus.PENDING
+            and new_status
+            in {
+                NotificationStatus.SENT,
+                NotificationStatus.FAILED,
+            }
+        )
+
+    def _append_delivery_log(
+        self,
+        *,
+        status: NotificationStatus,
+        message: str,
+    ) -> None:
+        self.delivery_logs.append(
+            DeliveryLog.create(
+                status=status,
+                message=message,
+            )
+        )
+
+    def _record_event(self, event: object) -> None:
+        self._domain_events.append(event)
+===== src/notification_service/domain/value_objects/__init__.py =====
+
+from .delivery_log import DeliveryLog
+from .notification_channel import NotificationChannel
+from .notification_id import NotificationId
+from .notification_status import NotificationStatus
+from .recipient import Recipient
+
+__all__ = [
+    "DeliveryLog",
+    "NotificationChannel",
+    "NotificationId",
+    "NotificationStatus",
+    "Recipient",
+]
+===== src/notification_service/domain/value_objects/delivery_log.py =====
+
+# src/notification_service/domain/value_objects/delivery_log.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from .notification_status import NotificationStatus
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryLog:
+    """
+    Immutable audit entry describing a change in notification delivery state.
+    """
+
+    status: NotificationStatus
+    message: str
+    occurred_at: datetime
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        status: NotificationStatus,
+        message: str,
+    ) -> DeliveryLog:
+        """Create a delivery log entry using the current UTC time."""
+        return cls(
+            status=status,
+            message=message,
+            occurred_at=datetime.now(timezone.utc),
+        )
+
+    def __post_init__(self) -> None:
+        if not self.message.strip():
+            raise ValueError("Delivery log message cannot be empty.")
+
+        if self.occurred_at.tzinfo is None:
+            raise ValueError("Delivery log timestamp must be timezone-aware.")
+===== src/notification_service/domain/value_objects/notification_channel.py =====
+
+# src/notification_service/domain/value_objects/notification_channel.py
+
+from enum import StrEnum
+
+
+class NotificationChannel(StrEnum):
+    """Supported notification delivery channels."""
+
+    PUSH = "push"
+    SMS = "sms"
+===== src/notification_service/domain/value_objects/notification_id.py =====
+
+# src/notification_service/domain/value_objects/notification_id.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from uuid import UUID, uuid4
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationId:
+    """
+    Unique identifier of a Notification aggregate.
+
+    The identifier is immutable and backed by UUID.
+    """
+
+    value: UUID
+
+    @classmethod
+    def generate(cls) -> NotificationId:
+        """Generate a new unique notification identifier."""
+        return cls(value=uuid4())
+
+    @classmethod
+    def from_string(cls, value: str) -> NotificationId:
+        """
+        Create a NotificationId from its string representation.
+
+        Raises:
+            ValueError: if the value is not a valid UUID.
+        """
+        return cls(value=UUID(value))
+
+    def __str__(self) -> str:
+        return str(self.value)
+===== src/notification_service/domain/value_objects/notification_status.py =====
+
+# src/notification_service/domain/value_objects/notification_status.py
+
+from enum import StrEnum
+
+
+class NotificationStatus(StrEnum):
+    """Lifecycle states of a Notification aggregate."""
+
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return True when the notification cannot transition further."""
+        return self in {
+            NotificationStatus.SENT,
+            NotificationStatus.FAILED,
+        }
+===== src/notification_service/domain/value_objects/recipient.py =====
+
+# src/notification_service/domain/value_objects/recipient.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Recipient:
+    """
+    Destination of a notification.
+
+    The domain deliberately does not know whether the recipient
+    will be reached through SMS, push, email, or another provider.
+    """
+
+    value: str
+
+    def __post_init__(self) -> None:
+        normalized_value = self.value.strip()
+
+        if not normalized_value:
+            raise ValueError("Recipient cannot be empty.")
+
+        object.__setattr__(self, "value", normalized_value)
+
+    def __str__(self) -> str:
+        return self.value
+===== src/notification_service/domain/events/__init__.py =====
+
+from .notification_delivery_failed import NotificationDeliveryFailed
+from .notification_sent import NotificationSent
+
+__all__ = [
+    "NotificationSent",
+    "NotificationDeliveryFailed",
+]
+===== src/notification_service/domain/events/notification_delivery_failed.py =====
+
+# src/notification_service/domain/events/notification_delivery_failed.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from ..value_objects.notification_id import NotificationId
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationDeliveryFailed:
+    """
+    Domain event raised when notification delivery fails.
+    """
+
+    notification_id: NotificationId
+    reason: str
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError("Failure reason cannot be empty.")
+===== src/notification_service/domain/events/notification_sent.py =====
+
+# src/notification_service/domain/events/notification_sent.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from ..value_objects.notification_id import NotificationId
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationSent:
+    """
+    Domain event raised when a notification is successfully delivered.
+    """
+
+    notification_id: NotificationId
+    occurred_at: datetime
+===== src/notification_service/domain/exceptions/__init__.py =====
+
+from .domain_exceptions import (
+    DomainException,
+    InvalidNotificationStateTransition,
+)
+
+__all__ = [
+    "DomainException",
+    "InvalidNotificationStateTransition",
+]
+===== src/notification_service/domain/exceptions/domain_exceptions.py =====
+
+# src/notification_service/domain/exceptions/domain_exceptions.py
+
+from __future__ import annotations
+
+
+class DomainException(Exception):
+    """Base exception for domain-level rule violations."""
+
+
+class InvalidNotificationStateTransition(DomainException):
+    """Raised when a Notification performs an illegal state transition."""
+
+    def __init__(
+        self,
+        *,
+        current_status: str,
+        requested_status: str,
+    ) -> None:
+        self.current_status = current_status
+        self.requested_status = requested_status
+
+        super().__init__(
+            f"Invalid notification state transition: "
+            f"{current_status} -> {requested_status}."
+        )
+===== src/notification_service/domain/__init__.py =====
+
+"""Core domain of the notification service."""
+===== src/notification_service/domain/repositories/__init__.py =====
+
+
+===== src/notification_service/__init__.py =====
+
+
+===== src/notification_service/application/__init__.py =====
+
+
+===== src/notification_service/application/commands/__init__.py =====
+
+
+===== src/notification_service/application/commands/process_delivery.py =====
+
+# src/notification_service/application/commands/process_delivery.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from notification_service.domain.value_objects.notification_id import NotificationId
+
+
+@dataclass(frozen=True)
+class ProcessDeliveryCommand:
+    """Input required to process a notification delivery."""
+
+    notification_id: NotificationId
+===== src/notification_service/application/commands/send_notification.py =====
+
+# src/notification_service/application/commands/send_notification.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from notification_service.domain.value_objects.notification_channel import (
+    NotificationChannel,
+)
+
+
+@dataclass(frozen=True)
+class SendNotificationCommand:
+    """Input required to create a new notification."""
+
+    recipient: str
+    channel: NotificationChannel
+    content: str
+===== src/notification_service/application/ports/__init__.py =====
+
+
+===== src/notification_service/application/ports/notification_provider.py =====
+
+# src/notification_service/application/ports/notification_provider.py
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from notification_service.domain.entities.notification import Notification
+
+
+class NotificationProvider(ABC):
+    """Port for external notification delivery providers."""
+
+    @abstractmethod
+    async def send(self, notification: Notification) -> None:
+        """Deliver a notification through an external provider."""
+        raise NotImplementedError
+===== src/notification_service/application/ports/notification_repository.py =====
+
+# src/notification_service/application/ports/notification_repository.py
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from notification_service.domain.entities.notification import Notification
+from notification_service.domain.value_objects.notification_id import NotificationId
+
+
+class NotificationRepository(ABC):
+    """Port for notification persistence."""
+
+    @abstractmethod
+    async def add(self, notification: Notification) -> None:
+        """Persist a new notification."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_by_id(
+        self,
+        notification_id: NotificationId,
+    ) -> Notification | None:
+        """Retrieve a notification by its identifier."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def save(self, notification: Notification) -> None:
+        """Persist changes to an existing notification."""
+        raise NotImplementedError
+===== src/notification_service/application/queries/__init__.py =====
+
+
+===== src/notification_service/application/queries/get_notification_status.py =====
+
+# src/notification_service/application/queries/get_notification_status.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from notification_service.domain.value_objects.notification_id import NotificationId
+
+
+@dataclass(frozen=True)
+class GetNotificationStatusQuery:
+    """Input required to retrieve a notification status."""
+
+    notification_id: NotificationId
+===== src/notification_service/application/use_cases/__init__.py =====
+
+
+===== src/notification_service/application/use_cases/get_status.py =====
+
+# src/notification_service/application/use_cases/get_status.py
+
+from __future__ import annotations
+
+from notification_service.application.exceptions.application_exceptions import NotificationNotFound
+from notification_service.application.ports.notification_repository import (
+    NotificationRepository,
+)
+from notification_service.application.queries.get_notification_status import (
+    GetNotificationStatusQuery,
+)
+
+from notification_service.domain.value_objects.notification_status import (
+    NotificationStatus,
+)
+
+
+class GetStatus:
+    """Retrieve the current status of a notification."""
+
+    def __init__(
+        self,
+        notification_repository: NotificationRepository,
+    ) -> None:
+        self._notification_repository = notification_repository
+
+    async def execute(
+        self,
+        query: GetNotificationStatusQuery,
+    ) -> NotificationStatus:
+        notification = await self._notification_repository.get_by_id(
+            query.notification_id,
+        )
+
+        if notification is None:
+            raise NotificationNotFound(
+                notification_id=str(query.notification_id),
+            )
+
+        return notification.status
+===== src/notification_service/application/use_cases/process_delivery.py =====
+
+# src/notification_service/application/use_cases/process_delivery.py
+
+from __future__ import annotations
+
+from notification_service.application.commands.process_delivery import (
+    ProcessDeliveryCommand,
+)
+from notification_service.application.exceptions.application_exceptions import NotificationNotFound
+from notification_service.application.ports.notification_provider import (
+    NotificationProvider,
+)
+from notification_service.application.ports.notification_repository import (
+    NotificationRepository,
+)
+
+
+
+class ProcessDelivery:
+    """Process the delivery of a pending notification."""
+
+    def __init__(
+        self,
+        notification_repository: NotificationRepository,
+        notification_provider: NotificationProvider,
+    ) -> None:
+        self._notification_repository = notification_repository
+        self._notification_provider = notification_provider
+
+    async def execute(
+        self,
+        command: ProcessDeliveryCommand,
+    ) -> None:
+        notification = await self._notification_repository.get_by_id(
+            command.notification_id,
+        )
+
+        if notification is None:
+            raise NotificationNotFound(
+                notification_id=str(command.notification_id),
+            )
+
+        try:
+            await self._notification_provider.send(notification)
+        except Exception as exc:
+            reason = str(exc).strip() or "Notification delivery failed."
+
+            notification.mark_as_failed(reason)
+            await self._notification_repository.save(notification)
+
+            return
+
+        notification.mark_as_sent()
+        await self._notification_repository.save(notification)
+===== src/notification_service/application/use_cases/send_notification.py =====
+
+# src/notification_service/application/use_cases/send_notification.py
+
+from __future__ import annotations
+
+from notification_service.application.commands.send_notification import (
+    SendNotificationCommand,
+)
+from notification_service.application.ports.notification_repository import (
+    NotificationRepository,
+)
+from notification_service.domain.entities.notification import Notification
+from notification_service.domain.value_objects.notification_id import NotificationId
+from notification_service.domain.value_objects.recipient import Recipient
+
+
+class SendNotification:
+    """Create and persist a new notification."""
+
+    def __init__(
+        self,
+        notification_repository: NotificationRepository,
+    ) -> None:
+        self._notification_repository = notification_repository
+
+    async def execute(
+        self,
+        command: SendNotificationCommand,
+    ) -> NotificationId:
+        notification = Notification.create(
+            recipient=Recipient(command.recipient),
+            channel=command.channel,
+            content=command.content,
+        )
+
+        await self._notification_repository.add(notification)
+
+        return notification.id
+===== src/notification_service/application/exceptions/__init__.py =====
+
+
+===== src/notification_service/application/exceptions/application_exceptions.py =====
+
+# src/notification_service/application/exceptions/application_exceptions.py
+
+from __future__ import annotations
+
+
+class ApplicationException(Exception):
+    """Base exception for application-level errors."""
+
+
+class NotificationNotFound(ApplicationException):
+    """Raised when a notification cannot be found."""
+
+    def __init__(self, *, notification_id: str) -> None:
+        self.notification_id = notification_id
+
+        super().__init__(
+            f"Notification '{notification_id}' was not found.",
+        )
+===== src/notification_service/config/__init__.py =====
+
+
+===== src/notification_service/config/logging.py =====
+
+
+===== src/notification_service/config/settings.py =====
+
+# src/notification_service/config/settings.py
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Application configuration."""
+
+    database_url: str = (
+        "postgresql+asyncpg://notification_user:"
+        "notification_password@localhost:5440/notification_db"
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return the cached application settings."""
+    return Settings()
+===== src/notification_service/infrastructure/__init__.py =====
+
+
+===== src/notification_service/infrastructure/cache/__init__.py =====
+
+
+===== src/notification_service/infrastructure/cache/redis/__init__.py =====
+
+
+===== src/notification_service/infrastructure/messaging/__init__.py =====
+
+
+===== src/notification_service/infrastructure/messaging/celery/__init__.py =====
+
+
+===== src/notification_service/infrastructure/messaging/kafka/__init__.py =====
+
+
+===== src/notification_service/infrastructure/messaging/outbox/__init__.py =====
+
+
+===== src/notification_service/infrastructure/persistence/__init__.py =====
+
+
+===== src/notification_service/infrastructure/persistence/models/__init__.py =====
+
+from notification_service.infrastructure.persistence.models.notification_model import (
+    Base,
+    NotificationModel,
+)
+
+__all__ = [
+    "Base",
+    "NotificationModel",
+]
+===== src/notification_service/infrastructure/persistence/models/notification_model.py =====
+
+# src/notification_service/infrastructure/persistence/models/notification_model.py
+
+from __future__ import annotations
+
+from datetime import datetime
+from uuid import UUID
+
+from sqlalchemy import DateTime, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """Base class for SQLAlchemy models."""
+
+
+class NotificationModel(Base):
+    """Persistence model for the Notification aggregate."""
+
+    __tablename__ = "notifications"
+
+    id: Mapped[UUID] = mapped_column(
+        primary_key=True,
+    )
+
+    recipient: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    channel: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+
+    content: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+===== src/notification_service/infrastructure/persistence/repositories/__init__.py =====
+
+from notification_service.infrastructure.persistence.repositories.sqlalchemy_notification_repository import (
+    SQLAlchemyNotificationRepository,
+)
+
+__all__ = [
+    "SQLAlchemyNotificationRepository",
+]
+===== src/notification_service/infrastructure/persistence/repositories/sqlalchemy_notification_repository.py =====
+
+# src/notification_service/infrastructure/persistence/repositories/sqlalchemy_notification_repository.py
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from notification_service.application.ports.notification_repository import (
+    NotificationRepository,
+)
+from notification_service.domain.entities.notification import Notification
+from notification_service.domain.value_objects.notification_channel import (
+    NotificationChannel,
+)
+from notification_service.domain.value_objects.notification_id import (
+    NotificationId,
+)
+from notification_service.domain.value_objects.notification_status import (
+    NotificationStatus,
+)
+from notification_service.domain.value_objects.recipient import Recipient
+from notification_service.infrastructure.persistence.models.notification_model import (
+    NotificationModel,
+)
+
+
+class SQLAlchemyNotificationRepository(NotificationRepository):
+    """SQLAlchemy implementation of the notification repository."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, notification: Notification) -> None:
+        now = datetime.now(timezone.utc)
+
+        model = NotificationModel(
+            id=notification.id.value,
+            recipient=notification.recipient.value,
+            channel=notification.channel.value,
+            content=notification.content,
+            status=notification.status.value,
+            created_at=now,
+            updated_at=now,
+        )
+
+        self._session.add(model)
+        await self._session.commit()
+
+    async def get_by_id(
+        self,
+        notification_id: NotificationId,
+    ) -> Notification | None:
+        statement = select(NotificationModel).where(
+            NotificationModel.id == notification_id.value,
+        )
+
+        result = await self._session.execute(statement)
+        model = result.scalar_one_or_none()
+
+        if model is None:
+            return None
+
+        return self._to_domain(model)
+
+    async def save(self, notification: Notification) -> None:
+        model = await self._session.get(
+            NotificationModel,
+            notification.id.value,
+        )
+
+        if model is None:
+            raise ValueError(
+                f"Notification '{notification.id}' does not exist.",
+            )
+
+        model.recipient = notification.recipient.value
+        model.channel = notification.channel.value
+        model.content = notification.content
+        model.status = notification.status.value
+        model.updated_at = datetime.now(timezone.utc)
+
+        await self._session.commit()
+
+    @staticmethod
+    def _to_domain(model: NotificationModel) -> Notification:
+        return Notification(
+            id=NotificationId(model.id),
+            recipient=Recipient(model.recipient),
+            channel=NotificationChannel(model.channel),
+            content=model.content,
+        )
+===== src/notification_service/infrastructure/persistence/unit_of_work/__init__.py =====
+
+
+===== src/notification_service/infrastructure/persistence/database.py =====
+
+# src/notification_service/infrastructure/persistence/database.py
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from notification_service.config.settings import get_settings
+
+
+settings = get_settings()
+
+engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+)
+
+async_session_factory = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """Provide an async SQLAlchemy session."""
+    async with async_session_factory() as session:
+        yield session
+===== src/notification_service/infrastructure/persistence/init_db.py =====
+
+# src/notification_service/infrastructure/persistence/init_db.py
+
+from __future__ import annotations
+
+from notification_service.infrastructure.persistence.database import engine
+from notification_service.infrastructure.persistence.models import Base
+
+
+async def init_db() -> None:
+    """Create database tables required by the application."""
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+===== src/notification_service/infrastructure/providers/__init__.py =====
+
+
+===== src/notification_service/infrastructure/providers/push/__init__.py =====
+
+
+===== src/notification_service/infrastructure/providers/sms/__init__.py =====
+
+
+===== src/notification_service/presentation/__init__.py =====
+
+
+===== src/notification_service/presentation/api/__init__.py =====
+
+from notification_service.presentation.api.app import app, create_app
+
+__all__ = [
+    "app",
+    "create_app",
+]
+===== src/notification_service/presentation/api/dependencies/__init__.py =====
+
+from notification_service.presentation.api.dependencies.dependencies import (
+    get_db_session,
+    get_notification_repository,
+    get_send_notification,
+)
+
+__all__ = [
+    "get_db_session",
+    "get_notification_repository",
+    "get_send_notification",
+]
+===== src/notification_service/presentation/api/dependencies/dependencies.py =====
+
+# src/notification_service/presentation/api/dependencies/dependencies.py
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from notification_service.application.ports.notification_repository import (
+    NotificationRepository,
+)
+from notification_service.application.use_cases.send_notification import (
+    SendNotification,
+)
+from notification_service.infrastructure.persistence.database import (
+    get_session,
+)
+from notification_service.infrastructure.persistence.repositories import (
+    SQLAlchemyNotificationRepository,
+)
+
+
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """Provide a database session to the request scope."""
+    async for session in get_session():
+        yield session
+
+
+def get_notification_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> NotificationRepository:
+    """Build the notification repository adapter."""
+    return SQLAlchemyNotificationRepository(session)
+
+
+def get_send_notification(
+    repository: NotificationRepository = Depends(
+        get_notification_repository,
+    ),
+) -> SendNotification:
+    """Build the SendNotification application service."""
+    return SendNotification(repository)
+===== src/notification_service/presentation/api/routes/__init__.py =====
+
+from notification_service.presentation.api.routes.notifications import router
+
+__all__ = [
+    "router",
+]
+===== src/notification_service/presentation/api/routes/notifications.py =====
+
+# src/notification_service/presentation/api/routes/notifications.py
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, status
+
+from notification_service.application.commands.send_notification import (
+    SendNotificationCommand,
+)
+from notification_service.application.use_cases.send_notification import (
+    SendNotification,
+)
+from notification_service.presentation.api.dependencies import (
+    get_send_notification,
+)
+from notification_service.presentation.api.schemas.notifications import (
+    CreateNotificationRequest,
+    CreateNotificationResponse,
+)
+
+
+router = APIRouter(
+    prefix="/notifications",
+    tags=["notifications"],
+)
+
+
+@router.post(
+    "",
+    response_model=CreateNotificationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_notification(
+    request: CreateNotificationRequest,
+    use_case: SendNotification = Depends(get_send_notification),
+) -> CreateNotificationResponse:
+    """Accept a notification for asynchronous delivery."""
+    command = SendNotificationCommand(
+        recipient=request.recipient,
+        channel=request.channel,
+        content=request.content,
+    )
+
+    notification_id = await use_case.execute(command)
+
+    return CreateNotificationResponse(
+        notification_id=notification_id.value,
+        status="pending",
+    )
+===== src/notification_service/presentation/api/schemas/__init__.py =====
+
+from notification_service.presentation.api.schemas.notifications import (
+    CreateNotificationRequest,
+    CreateNotificationResponse,
+)
+
+__all__ = [
+    "CreateNotificationRequest",
+    "CreateNotificationResponse",
+]
+===== src/notification_service/presentation/api/schemas/notifications.py =====
+
+# src/notification_service/presentation/api/schemas/notifications.py
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from notification_service.domain.value_objects.notification_channel import (
+    NotificationChannel,
+)
+from notification_service.domain.value_objects.notification_status import (
+    NotificationStatus,
+)
+
+
+class CreateNotificationRequest(BaseModel):
+    """HTTP request for creating a notification."""
+
+    recipient: str = Field(min_length=1)
+    channel: NotificationChannel
+    content: str = Field(min_length=1)
+
+
+class CreateNotificationResponse(BaseModel):
+    """HTTP response after accepting a notification."""
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    notification_id: UUID
+    status: NotificationStatus
+===== src/notification_service/presentation/api/app.py =====
+
+# src/notification_service/presentation/api/app.py
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
+from fastapi import FastAPI
+
+from notification_service.infrastructure.persistence.init_db import init_db
+from notification_service.presentation.api.routes.notifications import router
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Initialize infrastructure required by the application."""
+    await init_db()
+    yield
+
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    app = FastAPI(
+        title="Notification Service",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    app.include_router(router)
+
+    return app
+
+
+app = create_app()
+===== src/notification_service/main.py =====
+
+# src/notification_service/main.py
+
+from notification_service.presentation.api.app import app
+
+__all__ = [
+    "app",
+]
+===== src/__init__.py =====
+

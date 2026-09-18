@@ -136,6 +136,35 @@ class Notification:
 
         return events
 
+    @classmethod
+    def reconstitute(
+        cls,
+        *,
+        id: NotificationId,
+        recipient: Recipient,
+        channel: NotificationChannel,
+        content: str,
+        status: NotificationStatus,
+    ) -> Notification:
+        """
+        Reconstitute an existing Notification aggregate from persistence.
+
+        Reconstitution must not create a new creation audit log or domain
+        events because the aggregate already exists.
+        """
+        notification = cls(
+            id=id,
+            recipient=recipient,
+            channel=channel,
+            content=content,
+        )
+
+        notification.status = status
+        notification.delivery_logs.clear()
+        notification._domain_events.clear()
+
+        return notification
+
     def _transition_to(
         self,
         *,
