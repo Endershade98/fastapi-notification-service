@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 
 from ..events.notification_delivery_failed import NotificationDeliveryFailed
 from ..events.notification_sent import NotificationSent
-from ..exceptions.domain_exceptions import InvalidNotificationStateTransition
+from ..exceptions.domain_exceptions import (
+    InvalidNotificationStateTransition,
+)
 from ..value_objects.delivery_log import DeliveryLog
 from ..value_objects.notification_channel import NotificationChannel
 from ..value_objects.notification_id import NotificationId
@@ -53,6 +55,28 @@ class Notification:
             message="Notification created.",
         )
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        recipient: Recipient,
+        channel: NotificationChannel,
+        content: str,
+    ) -> Notification:
+        """
+        Create a new Notification aggregate.
+
+        The domain owns the generation of the NotificationId so that
+        application services do not need to know how aggregate identity
+        is created.
+        """
+        return cls(
+            id=NotificationId.generate(),
+            recipient=recipient,
+            channel=channel,
+            content=content,
+        )
+
     def mark_as_sent(self) -> None:
         """
         Transition the notification from PENDING to SENT.
@@ -80,6 +104,7 @@ class Notification:
         Raises:
             InvalidNotificationStateTransition:
                 if the notification is not currently PENDING.
+
             ValueError:
                 if the failure reason is empty.
         """
@@ -108,6 +133,7 @@ class Notification:
         """
         events = list(self._domain_events)
         self._domain_events.clear()
+
         return events
 
     def _transition_to(
