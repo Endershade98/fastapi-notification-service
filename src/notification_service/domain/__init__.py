@@ -1,0 +1,1 @@
+"""Core domain of the notification service."""
